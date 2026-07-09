@@ -1,7 +1,8 @@
 from functools import cache, cached_property
 from typing import Any
 
-from openai import OpenAI, AsyncOpenAI
+import httpx
+from openai import OpenAI, AsyncOpenAI, DefaultHttpxClient, DefaultAsyncHttpxClient
 from openai.types import ChatModel
 from openai.types.chat import ChatCompletionMessageParam
 from pydantic import Field
@@ -22,7 +23,10 @@ def _chat_create_method():
 
 
 # Fields baked into the cached clients; changing one drops the cache.
-_CLIENT_CONFIG_FIELDS = frozenset({"api_key", "base_url", "max_retries", "timeout"})
+_CLIENT_CONFIG_FIELDS = frozenset({
+    "api_key", "base_url", "max_retries", "timeout",
+    "keepalive_expiry", "max_keepalive_connections", "max_connections",
+})
 
 
 class OpenAILLM(LLM):
@@ -31,6 +35,13 @@ class OpenAILLM(LLM):
     base_url: str | None = None
     max_retries: int = 2
     timeout: float = 20  # seconds
+    # httpx connection-pool tuning. Defaults mirror the openai SDK
+    # (Limits(max_connections=1000, max_keepalive_connections=100,
+    # keepalive_expiry=5.0)); the effective keep-alive window is
+    # min(keepalive_expiry, server idle timeout).
+    keepalive_expiry: float = 5.0  # seconds an idle connection stays reusable
+    max_keepalive_connections: int = 100
+    max_connections: int = 1000
     stream_include_usage: bool = Field(
         default=False,
         description="If set, the token usage will return at the end of stream."
@@ -110,22 +121,31 @@ class OpenAILLM(LLM):
             self.__dict__.pop("async_client", None)
         super().__setattr__(name, value)
 
+    def _pool_limits(self) -> httpx.Limits:
+        return httpx.Limits(max_connections=self.max_connections,
+                            max_keepalive_connections=self.max_keepalive_connections,
+                            keepalive_expiry=self.keepalive_expiry)
+
     # Clients are cached per LLM instance so the underlying httpx connection
     # pool is reused across calls (a new client per call means a TCP/TLS
     # handshake per request and zero keep-alive reuse).
+    # DefaultHttpxClient/DefaultAsyncHttpxClient keep the SDK's other defaults
+    # (timeout, follow_redirects) while letting us override the pool limits.
     @cached_property
     def client(self) -> OpenAI:
         return OpenAI(api_key=self.api_key,
                       base_url=self.base_url,
                       max_retries=self.max_retries,
-                      timeout=self.timeout)
+                      timeout=self.timeout,
+                      http_client=DefaultHttpxClient(limits=self._pool_limits()))
 
     @cached_property
     def async_client(self) -> AsyncOpenAI:
         return AsyncOpenAI(api_key=self.api_key,
                            base_url=self.base_url,
                            max_retries=self.max_retries,
-                           timeout=self.timeout)
+                           timeout=self.timeout,
+                           http_client=DefaultAsyncHttpxClient(limits=self._pool_limits()))
 
     @property
     def openai_tools(self) -> list[dict[str, Any]] | None:
