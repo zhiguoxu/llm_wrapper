@@ -1,3 +1,4 @@
+from functools import cache, cached_property
 from typing import Any
 
 from openai import OpenAI, AsyncOpenAI
@@ -11,6 +12,17 @@ from llm_wrapper.openai_llm.utils import async_chat_result_from_openai, to_opena
     tools_to_openai, \
     tool_choice_to_openai, tool_to_openai
 from llm_wrapper.utils import filter_kwargs_by_method
+
+
+@cache
+def _chat_create_method():
+    # Dummy client built once, only to expose the create() signature for
+    # kwargs filtering (never performs a request).
+    return OpenAI(api_key="none").chat.completions.create
+
+
+# Fields baked into the cached clients; changing one drops the cache.
+_CLIENT_CONFIG_FIELDS = frozenset({"api_key", "base_url", "max_retries", "timeout"})
 
 
 class OpenAILLM(LLM):
@@ -88,17 +100,28 @@ class OpenAILLM(LLM):
         if kwargs.pop("json_mode", False):
             kwargs["response_format"] = {"type": "json_object"}
 
-        return filter_kwargs_by_method(OpenAI(api_key='none').chat.completions.create, kwargs, exclude_none=True)
+        return filter_kwargs_by_method(_chat_create_method(), kwargs, exclude_none=True)
 
-    @property
-    def client(self):
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Assigning a *different* value to a client config field invalidates
+        # the cached clients; reassigning the same value keeps the warm pool.
+        if name in _CLIENT_CONFIG_FIELDS and getattr(self, name, None) != value:
+            self.__dict__.pop("client", None)
+            self.__dict__.pop("async_client", None)
+        super().__setattr__(name, value)
+
+    # Clients are cached per LLM instance so the underlying httpx connection
+    # pool is reused across calls (a new client per call means a TCP/TLS
+    # handshake per request and zero keep-alive reuse).
+    @cached_property
+    def client(self) -> OpenAI:
         return OpenAI(api_key=self.api_key,
                       base_url=self.base_url,
                       max_retries=self.max_retries,
                       timeout=self.timeout)
 
-    @property
-    def async_client(self):
+    @cached_property
+    def async_client(self) -> AsyncOpenAI:
         return AsyncOpenAI(api_key=self.api_key,
                            base_url=self.base_url,
                            max_retries=self.max_retries,
