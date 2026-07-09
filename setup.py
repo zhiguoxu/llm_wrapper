@@ -5,7 +5,7 @@ with open('requirements.txt') as f:
 
 setup(
     name='llm_wrapper',
-    version='0.1.3',
+    version='0.1.4',
     packages=find_packages(where='src'),  # 指定包的位置
     package_dir={'': 'src'},
     # package_data={"xxx.config": ["*.json"]},
